@@ -1155,12 +1155,19 @@ function Stop-ClaudeServices {
         Write-Log "No cowork-svc Windows service found."
     }
 
-    foreach ($procName in @("claude", "cowork-svc")) {
-        $procs = Get-Process -Name $procName -ErrorAction SilentlyContinue
-        if ($procs) {
-            Write-Log "Killing $($procs.Count) '$procName' process(es)..."
-            $procs | Stop-Process -Force -ErrorAction SilentlyContinue
-        }
+    # Claude Desktop: kill ONLY the MSIX Desktop processes (WindowsApps\Claude_*),
+    # never the Claude Code CLI/editor (also claude.exe) -- killing that would
+    # crash the user's Claude Code session.
+    $deskProcs = Get-DesktopClaudeProcs
+    if ($deskProcs) {
+        Write-Log "Killing $($deskProcs.Count) Claude Desktop process(es) (sparing any Claude Code)..."
+        $deskProcs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    }
+    # cowork-svc is unambiguous (no Claude Code name collision).
+    $svcProcs = Get-Process -Name 'cowork-svc' -ErrorAction SilentlyContinue
+    if ($svcProcs) {
+        Write-Log "Killing $($svcProcs.Count) 'cowork-svc' process(es)..."
+        $svcProcs | Stop-Process -Force -ErrorAction SilentlyContinue
     }
 
     Start-Sleep -Seconds 2
@@ -1222,6 +1229,44 @@ function Wait-FileUnlock([string]$Path, [int]$TimeoutSeconds = 20, [string]$Acce
         Start-Sleep -Seconds 1
     }
     throw "File '$(Split-Path $Path -Leaf)' is still locked after ${TimeoutSeconds}s. A process may still be using it. Try rebooting and running again."
+}
+
+# --- Pristine-source detection (anti-poison) --------------------------------
+# A previous partial/failed run -- or a DIFFERENT RTL tool (e.g. liorshaya's,
+# whose backups use a .crtl-bak suffix) -- can leave the LIVE file already
+# patched. If we then snapshot that as our .bak and later read it as the
+# "pristine" source for the binary phase, the Anthropic cert anchor is gone and
+# Phase 2/3 throws "certificate pattern not found" -- and can leave a half-patched,
+# broken-Cowork install. These helpers verify true-pristine and pick a good source.
+function Test-PristineFile([string]$Path, [string]$Type) {
+    if (-not (Test-Path $Path)) { return $false }
+    try {
+        if ($Type -eq 'asar' -or $Type -eq 'cowork') {
+            $bytes = [System.IO.File]::ReadAllBytes($Path)
+            $s = [System.Text.Encoding]::GetEncoding(28591).GetString($bytes)
+            if ($Type -eq 'asar') { return (-not $s.Contains('claude-rtl-payload-v1')) }
+            return $s.Contains('Anthropic, PBC')   # pristine cert anchor (with comma)
+        } elseif ($Type -eq 'exe') {
+            $sig = Get-AuthenticodeSignature -FilePath $Path
+            return ($sig.Status -eq 'Valid' -and $sig.SignerCertificate -and ($sig.SignerCertificate.Subject -match 'Anthropic, PBC'))
+        }
+    } catch { return $false }
+    return $false
+}
+# Path to a genuinely-pristine copy of $Live, or $null. Preference order:
+# the live file, then our own .bak, then a foreign .crtl-bak (liorshaya's tool).
+function Get-PristineSource([string]$Live, [string]$Type) {
+    foreach ($cand in @($Live, "$Live.bak", "$Live.crtl-bak")) {
+        if (Test-PristineFile $cand $Type) { return $cand }
+    }
+    return $null
+}
+# Claude DESKTOP processes only (exe under WindowsApps\Claude_*). NEVER the
+# Claude Code CLI/editor -- also named claude.exe -- which must survive
+# (killing it would crash the user's Claude Code session).
+function Get-DesktopClaudeProcs {
+    @(Get-CimInstance Win32_Process -Filter "Name='Claude.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.ExecutablePath -and $_.ExecutablePath -like '*\WindowsApps\Claude_*' })
 }
 
 function Get-FileHolders([string]$Path) {
@@ -1927,8 +1972,13 @@ function Invoke-AutoPatch($newVer, $exePath) {
 
     Show-Toast "Claude updated to v$newVer" "Auto-patching now. A PowerShell window will open with the patch log."
 
-    # Kill running Claude processes for snappy UX (patch.ps1 will kill again via Stop-ClaudeServices).
-    Get-Process -Name claude,cowork-svc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # Kill running Claude DESKTOP processes for snappy UX (patch.ps1 kills again via
+    # Stop-ClaudeServices). Filter to WindowsApps\Claude_* so we never kill the
+    # Claude Code CLI/editor (also named claude.exe) and crash the user's session.
+    Get-CimInstance Win32_Process -Filter "Name='claude.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.ExecutablePath -like '*\WindowsApps\Claude_*' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Get-Process -Name cowork-svc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
     try {
         # Propagate the pinned pubkey to the child so any re-registration that
@@ -2209,9 +2259,30 @@ function Install-Patch {
     # Backup READS these files, so a read-access gate is what matches the operation.
     Wait-FileUnlock -Path $ExePath -TimeoutSeconds 15 -Access Read
     Wait-FileUnlock -Path $CoworkSvcPath -TimeoutSeconds 15 -Access Read
-    if (-not (Test-Path "$AsarPath.bak"))      { Copy-FileSafe $AsarPath      "$AsarPath.bak"      'asar'; Write-Success "app.asar.bak created" }
-    if (-not (Test-Path "$ExePath.bak") -and (Test-Path $ExePath))             { Copy-FileSafe $ExePath        "$ExePath.bak"        'pe';   Write-Success "claude.exe.bak created" }
-    if (-not (Test-Path "$CoworkSvcPath.bak") -and (Test-Path $CoworkSvcPath)) { Copy-FileSafe $CoworkSvcPath  "$CoworkSvcPath.bak"  'pe';   Write-Success "cowork-svc.exe.bak created" }
+
+    # ANTI-POISON: never snapshot an already-patched file as the "pristine" .bak.
+    # A prior failed run or a different RTL tool may have patched the live files;
+    # backing THOSE up (and later reading them as the binary-phase source) is what
+    # makes Phase 2/3 fail with "certificate pattern not found" and leaves a broken,
+    # half-patched Cowork. For each file, resolve a genuinely-pristine source
+    # (live -> our .bak -> foreign .crtl-bak) and make .bak equal it. If nothing
+    # pristine exists, abort cleanly rather than producing a broken install.
+    $PristineSpec = @(
+        @{ Live = $AsarPath;      Type = 'asar';   Label = 'app.asar' },
+        @{ Live = $ExePath;       Type = 'exe';    Label = 'claude.exe' },
+        @{ Live = $CoworkSvcPath; Type = 'cowork'; Label = 'cowork-svc.exe' }
+    )
+    foreach ($spec in $PristineSpec) {
+        if (-not (Test-Path $spec.Live)) { continue }
+        $bak = "$($spec.Live).bak"
+        if ((Test-Path $bak) -and (Test-PristineFile $bak $spec.Type)) { continue }  # existing .bak is good
+        $src = Get-PristineSource $spec.Live $spec.Type
+        if (-not $src) {
+            throw "No pristine copy of $($spec.Label) found (live, .bak and .crtl-bak are all already patched).`n    Restore the original Claude first (Restore option, or a matching .crtl-bak), or reinstall Claude:`n      Get-AppxPackage *Claude* | Remove-AppxPackage`n    Aborting before touching any live files."
+        }
+        Copy-FileSafe $src $bak $(if ($spec.Type -eq 'asar') { 'asar' } else { 'pe' })
+        Write-Success "$($spec.Label).bak set from pristine source ($(Split-Path $src -Leaf))"
+    }
 
     # Always restore from backup before patching — ensures clean state
     # First run: .bak was just created from same file → copy is a no-op (safe)
@@ -2387,9 +2458,13 @@ function Install-Patch {
         Write-Step "Phase 2 & 3: Executable Patching & Cert Synchronization"
         if ((Test-Path $ExePath) -and (Test-Path $CoworkSvcPath)) {
 
-            # Read from .bak when present so the patch is idempotent on re-runs.
-            $SourceSvc = if (Test-Path "$CoworkSvcPath.bak") { "$CoworkSvcPath.bak" } else { $CoworkSvcPath }
-            $SourceExe = if (Test-Path "$ExePath.bak") { "$ExePath.bak" } else { $ExePath }
+            # Read from a PRISTINE source (never an already-patched file) so the
+            # cert anchor + real asar hash are present. .bak is guaranteed pristine
+            # by the anti-poison step above; resolve defensively and abort if not.
+            $SourceSvc = Get-PristineSource $CoworkSvcPath 'cowork'
+            $SourceExe = Get-PristineSource $ExePath 'exe'
+            if (-not $SourceSvc) { throw "No pristine cowork-svc.exe source for the cert step. Run Restore or reinstall Claude, then re-run." }
+            if (-not $SourceExe) { throw "No pristine claude.exe source for the hash step. Run Restore or reinstall Claude, then re-run." }
 
             $SvcBytes = [System.IO.File]::ReadAllBytes($SourceSvc)
             $AnchorBytes = [System.Text.Encoding]::ASCII.GetBytes("Anthropic, PBC")
@@ -2521,9 +2596,19 @@ function Install-Patch {
             }
 
             Write-Log "Re-signing claude.exe with self-signed certificate (this can take several seconds)..."
-            $SignResult = Set-AuthenticodeSignature -FilePath $ExePath -Certificate $Cert -HashAlgorithm SHA256
-            if ($SignResult.Status -eq 'Valid') { Write-Success "Successfully re-signed claude.exe" }
-            else { throw "Re-signing claude.exe failed: $($SignResult.Status)" }
+            # Claude Desktop may relaunch during the slow hash scan/write and re-lock its
+            # own exe (and cowork-svc pins it). Kill Desktop Claude and retry a few times
+            # so a transient relaunch can't fail the whole patch.
+            $SignResult = $null
+            for ($att = 1; $att -le 6; $att++) {
+                try { $SignResult = Set-AuthenticodeSignature -FilePath $ExePath -Certificate $Cert -HashAlgorithm SHA256 }
+                catch { if ($att -eq 6) { throw }; Write-Warn "re-sign claude.exe attempt $att/6 threw ($($_.Exception.Message)); stopping Desktop Claude and retrying..."; Stop-ClaudeServices; Start-Sleep -Milliseconds 800; continue }
+                if ($SignResult.Status -eq 'Valid') { break }
+                if ($att -eq 6) { throw "Re-signing claude.exe failed: $($SignResult.Status)" }
+                Write-Warn "re-sign claude.exe returned $($SignResult.Status) (attempt $att/6); stopping Desktop Claude and retrying..."
+                Stop-ClaudeServices; Start-Sleep -Milliseconds 800
+            }
+            Write-Success "Successfully re-signed claude.exe"
 
             Wait-FileUnlock $CoworkSvcPath
             $Diff = $OldCertSize - $NewCertBytes.Length
@@ -2537,9 +2622,16 @@ function Install-Patch {
             Write-Success "Binary cert replacement completed in cowork-svc.exe"
 
             Write-Log "Re-signing cowork-svc.exe with self-signed certificate (this can take several seconds)..."
-            $SignResult2 = Set-AuthenticodeSignature -FilePath $CoworkSvcPath -Certificate $Cert -HashAlgorithm SHA256
-            if ($SignResult2.Status -eq 'Valid') { Write-Success "Successfully re-signed cowork-svc.exe" }
-            else { throw "Re-signing cowork-svc.exe failed: $($SignResult2.Status)" }
+            $SignResult2 = $null
+            for ($att = 1; $att -le 6; $att++) {
+                try { $SignResult2 = Set-AuthenticodeSignature -FilePath $CoworkSvcPath -Certificate $Cert -HashAlgorithm SHA256 }
+                catch { if ($att -eq 6) { throw }; Write-Warn "re-sign cowork-svc.exe attempt $att/6 threw ($($_.Exception.Message)); stopping Desktop Claude and retrying..."; Stop-ClaudeServices; Start-Sleep -Milliseconds 800; continue }
+                if ($SignResult2.Status -eq 'Valid') { break }
+                if ($att -eq 6) { throw "Re-signing cowork-svc.exe failed: $($SignResult2.Status)" }
+                Write-Warn "re-sign cowork-svc.exe returned $($SignResult2.Status) (attempt $att/6); stopping Desktop Claude and retrying..."
+                Stop-ClaudeServices; Start-Sleep -Milliseconds 800
+            }
+            Write-Success "Successfully re-signed cowork-svc.exe"
 
             # 7. WIPE PRIVATE KEY: public cert stays in Root for verification, but the
             # private key is no longer needed and would let an admin-level attacker

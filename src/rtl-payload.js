@@ -328,8 +328,130 @@
             document.head.appendChild(s);
         }
 
+        // --- USER CONTROL PANEL (chat font family/size + DevTools) ------------
+        // A small gear button (top-right, below the window controls). Hover or
+        // click it to set the chat font family/size or open DevTools. Settings
+        // persist in localStorage and re-apply on every launch. The panel lives
+        // in a Shadow DOM so its markup/styles are isolated from the page AND
+        // from the RTL processors above (which walk the light DOM only).
+        var RTL_SETTINGS_KEY = 'claudeRtlUiSettings';
+        // Chat message text we restyle. If a future Claude build renames these,
+        // open DevTools from the panel to find the new class and tell the patch.
+        var RTL_MSG_SEL = '.font-claude-message, .font-user-message, [data-testid="user-message"], [data-testid="chat-input"], .prose';
+        var RTL_FONTS = [
+            ['Default', ''],
+            ['System UI', 'system-ui, "Segoe UI", sans-serif'],
+            ['Arial', 'Arial, sans-serif'],
+            ['Calibri', 'Calibri, sans-serif'],
+            ['Georgia', 'Georgia, serif'],
+            ['Times New Roman', '"Times New Roman", serif'],
+            ['David (Hebrew)', '"David", "David CLM", serif'],
+            ['Frank Ruehl (Hebrew)', '"FrankRuehl", "Frank Ruehl CLM", serif'],
+            ['Courier New', '"Courier New", monospace']
+        ];
+
+        function rtlLoadSettings() {
+            try { var raw = localStorage.getItem(RTL_SETTINGS_KEY); if (raw) return JSON.parse(raw); } catch (e) {}
+            return { fontFamily: '', fontScale: 1 };
+        }
+        function rtlSaveSettings(s) {
+            try { localStorage.setItem(RTL_SETTINGS_KEY, JSON.stringify(s)); } catch (e) {}
+        }
+        function rtlApplySettings(s) {
+            var st = document.getElementById('claude-rtl-user-style');
+            if (!st) {
+                st = document.createElement('style');
+                st.id = 'claude-rtl-user-style';
+                (document.head || document.documentElement).appendChild(st);
+            }
+            var scale = (s && s.fontScale) ? s.fontScale : 1;
+            var fam = (s && s.fontFamily) ? s.fontFamily : '';
+            var css = RTL_MSG_SEL + '{font-size:calc(' + scale + ' * 1em)!important;}';
+            if (fam) {
+                css += RTL_MSG_SEL + '{font-family:' + fam + '!important;}';
+                // keep code/pre monospaced regardless of the chosen prose font
+                css += '.prose code,.prose pre,code,pre,pre *,code *{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Courier New",monospace!important;}';
+            }
+            st.textContent = css;
+        }
+
+        function initControlPanel() {
+            if (!document.body || document.getElementById('claude-rtl-panel')) return;
+
+            var settings = rtlLoadSettings();
+            rtlApplySettings(settings);
+
+            var host = document.createElement('div');
+            host.id = 'claude-rtl-panel';
+            host.setAttribute('dir', 'ltr');
+            host.style.cssText = 'position:fixed;top:40px;right:10px;z-index:2147483647;';
+            // Electron custom title bars are drag regions; keep our widget clickable.
+            host.style.webkitAppRegion = 'no-drag';
+            var root = host.attachShadow ? host.attachShadow({ mode: 'open' }) : host;
+
+            var fontOptions = RTL_FONTS.map(function(f) {
+                var sel = (f[1] === settings.fontFamily) ? ' selected' : '';
+                return '<option value="' + f[1].replace(/"/g, '&quot;') + '"' + sel + '>' + f[0] + '</option>';
+            }).join('');
+
+            root.innerHTML =
+                '<style>' +
+                ':host,*{box-sizing:border-box;font-family:system-ui,"Segoe UI",sans-serif}' +
+                '.gear{width:32px;height:32px;border-radius:8px;background:rgba(30,30,30,.82);color:#eee;border:1px solid rgba(255,255,255,.15);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:17px;box-shadow:0 2px 8px rgba(0,0,0,.35);user-select:none}' +
+                '.gear:hover{background:rgba(50,50,50,.95)}' +
+                '.menu{position:absolute;top:38px;right:0;width:232px;background:rgba(28,28,30,.98);color:#eee;border:1px solid rgba(255,255,255,.15);border-radius:10px;padding:12px;box-shadow:0 8px 28px rgba(0,0,0,.5);display:none;font-size:13px}' +
+                '.wrap:hover .menu,.menu.pin{display:block}' +
+                '.row{margin:8px 0}' +
+                '.row label{display:block;margin-bottom:4px;opacity:.8;font-size:12px}' +
+                'select{width:100%;padding:5px;border-radius:6px;background:#111;color:#eee;border:1px solid rgba(255,255,255,.2);font:inherit}' +
+                '.sz{display:flex;align-items:center;gap:8px}' +
+                '.sz button{width:30px;height:30px;border-radius:6px;background:#111;color:#eee;border:1px solid rgba(255,255,255,.2);cursor:pointer;font-size:16px;font:inherit}' +
+                '.sz span{flex:1;text-align:center}' +
+                '.act{width:100%;padding:7px;border-radius:6px;background:#2b6cb0;color:#fff;border:0;cursor:pointer;margin-top:4px;font:inherit}' +
+                '.act.sec{background:#333}' +
+                '</style>' +
+                '<div class="wrap">' +
+                '<div class="gear" title="Claude RTL settings">&#9881;</div>' +
+                '<div class="menu">' +
+                '<div class="row"><label>Chat font</label><select class="ff">' + fontOptions + '</select></div>' +
+                '<div class="row"><label>Font size</label><div class="sz"><button class="dec">&#8722;</button><span class="val"></span><button class="inc">+</button></div></div>' +
+                '<div class="row"><button class="act dev">Open DevTools</button></div>' +
+                '<div class="row"><button class="act sec reset">Reset</button></div>' +
+                '</div></div>';
+
+            (document.body || document.documentElement).appendChild(host);
+
+            var menu = root.querySelector('.menu');
+            var val = root.querySelector('.val');
+            var ff = root.querySelector('.ff');
+            function renderVal() { val.textContent = Math.round((settings.fontScale || 1) * 100) + '%'; }
+            renderVal();
+
+            root.querySelector('.gear').addEventListener('click', function() { menu.classList.toggle('pin'); });
+            ff.addEventListener('change', function() {
+                settings.fontFamily = ff.value; rtlSaveSettings(settings); rtlApplySettings(settings);
+            });
+            function bump(delta) {
+                var s = (settings.fontScale || 1) + delta;
+                s = Math.max(0.7, Math.min(2, Math.round(s * 100) / 100));
+                settings.fontScale = s; renderVal(); rtlSaveSettings(settings); rtlApplySettings(settings);
+            }
+            root.querySelector('.dec').addEventListener('click', function() { bump(-0.1); });
+            root.querySelector('.inc').addEventListener('click', function() { bump(0.1); });
+            root.querySelector('.dev').addEventListener('click', function() {
+                // No preload/IPC bridge exists; signal the main process with a magic
+                // console message (the main-process patch listens and opens DevTools).
+                try { console.log('__CLAUDE_RTL_OPEN_DEVTOOLS__'); } catch (e) {}
+            });
+            root.querySelector('.reset').addEventListener('click', function() {
+                settings = { fontFamily: '', fontScale: 1 };
+                ff.value = ''; renderVal(); rtlSaveSettings(settings); rtlApplySettings(settings);
+            });
+        }
+
         function init() {
             injectStyles();
+            initControlPanel();
             processAll();
 
             // Input box live direction switching
@@ -387,6 +509,7 @@
                     } else {
                         processAll();
                     }
+                    initControlPanel();   // re-add the panel if a re-render removed it
                 }, 50);
             });
             obs.observe(document.body, { childList: true, subtree: true, characterData: true });

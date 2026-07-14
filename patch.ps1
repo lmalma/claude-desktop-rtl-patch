@@ -699,6 +699,10 @@ function majorityDir(dirs) {
         var RTL_MSG_SEL = '.font-claude-message, .font-user-message, [data-testid="user-message"], [data-testid="chat-input"], .prose';
         var RTL_FONTS = [
             ['Default', ''],
+            ['Assistant', '"Assistant", sans-serif'],
+            ['Arimo', '"Arimo", Arial, sans-serif'],
+            ['Open Sans', '"Open Sans", sans-serif'],
+            ['Google Sans', '"Google Sans", "Product Sans", sans-serif'],
             ['System UI', 'system-ui, "Segoe UI", sans-serif'],
             ['Arial', 'Arial, sans-serif'],
             ['Calibri', 'Calibri, sans-serif'],
@@ -2313,6 +2317,66 @@ function Uninstall-AutoUpdateTask {
 }
 
 # -----------------------------------------------------------------------------
+# Bundle the RTL control-panel fonts (Assistant / Arimo / Open Sans) so the
+# in-app "Chat font" picker actually renders them without the user installing
+# anything. They are installed PER-USER (no admin, no logoff): copied to
+# %LOCALAPPDATA%\Microsoft\Windows\Fonts and registered under HKCU, then a
+# WM_FONTCHANGE broadcast + Claude restart makes Chromium/DirectWrite enumerate
+# them. Downloaded once from the fork over the same trusted GitHub path the patch
+# itself uses (no Google CDN / CSP dependency at runtime). Best-effort: any
+# failure is logged and skipped -- it must NEVER fail the patch. Google Sans is
+# proprietary and intentionally NOT bundled (offered name-only in the picker).
+$RtlFontBaseUrl = 'https://raw.githubusercontent.com/lmalma/claude-desktop-rtl-patch/selfhost/fonts'
+function Install-RtlFonts {
+    try {
+        $fonts = @(
+            @{ File = 'Assistant.ttf'; Reg = 'Assistant (TrueType)' },
+            @{ File = 'Arimo.ttf';     Reg = 'Arimo (TrueType)' },
+            @{ File = 'OpenSans.ttf';  Reg = 'Open Sans (TrueType)' }
+        )
+        $fontDir = Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\Fonts'
+        New-Item -ItemType Directory -Force -Path $fontDir | Out-Null
+        $regKey = 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Fonts'
+        if (-not (Test-Path $regKey)) { New-Item -Path $regKey -Force | Out-Null }
+
+        if (-not ([System.Management.Automation.PSTypeName]'RtlFontApi').Type) {
+            Add-Type -Namespace '' -Name 'RtlFontApi' -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("gdi32.dll", CharSet=System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern int AddFontResourceW(string lpFileName);
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet=System.Runtime.InteropServices.CharSet.Auto)]
+public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint Msg, System.IntPtr wParam, System.IntPtr lParam, uint fuFlags, uint uTimeout, out System.IntPtr lpdwResult);
+"@ -ErrorAction Stop
+        }
+
+        $changed = $false
+        foreach ($f in $fonts) {
+            $target = Join-Path $fontDir $f.File
+            if (-not (Test-Path $target)) {
+                try {
+                    $wc = New-Object System.Net.WebClient
+                    $wc.DownloadFile("$RtlFontBaseUrl/$($f.File)", $target)
+                } catch {
+                    Write-Warn "Font download skipped for $($f.File): $($_.Exception.Message)"
+                    continue
+                }
+            }
+            # Per-user font registry values hold the FULL path (system fonts use a bare name).
+            Set-ItemProperty -Path $regKey -Name $f.Reg -Value $target -Force -ErrorAction SilentlyContinue
+            [void][RtlFontApi]::AddFontResourceW($target)
+            $changed = $true
+            Write-Success "Installed font: $($f.File)"
+        }
+        if ($changed) {
+            # WM_FONTCHANGE = 0x1D; HWND_BROADCAST = 0xFFFF; SMTO_ABORTIFHUNG = 0x0002
+            $res = [System.IntPtr]::Zero
+            [void][RtlFontApi]::SendMessageTimeout([System.IntPtr]0xFFFF, 0x1D, [System.IntPtr]::Zero, [System.IntPtr]::Zero, 0x0002, 1000, [ref]$res)
+        }
+    } catch {
+        Write-Warn "Font install skipped (non-fatal): $($_.Exception.Message)"
+    }
+}
+
+# -----------------------------------------------------------------------------
 # CORE PATCHING LOGIC (WITH ATOMIC FALLBACK)
 # -----------------------------------------------------------------------------
 function Install-Patch {
@@ -2819,6 +2883,8 @@ function Install-Patch {
         }
 
         Write-Step "Cleanup & Launch"
+        # Install the control-panel fonts (best-effort; never fails the patch).
+        Install-RtlFonts
         if (Test-Path $global:TmpDir) { Remove-Item $global:TmpDir -Recurse -Force }
         Save-PatchState -InstallPath $ClaudeDir
 

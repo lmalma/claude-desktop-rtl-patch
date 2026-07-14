@@ -340,6 +340,10 @@
         var RTL_MSG_SEL = '.font-claude-message, .font-user-message, [data-testid="user-message"], [data-testid="chat-input"], .prose';
         var RTL_FONTS = [
             ['Default', ''],
+            ['Assistant', '"Assistant", sans-serif'],
+            ['Arimo', '"Arimo", Arial, sans-serif'],
+            ['Open Sans', '"Open Sans", sans-serif'],
+            ['Google Sans', '"Google Sans", "Product Sans", sans-serif'],
             ['System UI', 'system-ui, "Segoe UI", sans-serif'],
             ['Arial', 'Arial, sans-serif'],
             ['Calibri', 'Calibri, sans-serif'],

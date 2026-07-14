@@ -12,3 +12,6 @@ tools/*.ps1     text eol=lf
 
 # The pre-commit hook itself is bash -- LF is mandatory anyway.
 .git/hooks/*    text eol=lf
+
+# Font binaries must never be EOL-normalized.
+fonts/*.ttf binary

@@ -687,16 +687,17 @@ function majorityDir(dirs) {
             document.head.appendChild(s);
         }
 
-        // --- USER CONTROL PANEL (chat font family/size + DevTools) ------------
-        // A small gear button (top-right, below the window controls). Hover or
-        // click it to set the chat font family/size or open DevTools. Settings
-        // persist in localStorage and re-apply on every launch. The panel lives
-        // in a Shadow DOM so its markup/styles are isolated from the page AND
-        // from the RTL processors above (which walk the light DOM only).
+        // --- USER CONTROL PANEL (chat font family / weight / size) -----------
+        // A small DRAGGABLE gear button. Click it to open the menu; click it
+        // again, click outside, or pick a value to close. Font family, weight,
+        // size AND the button's own position persist in localStorage and
+        // re-apply on every launch. The panel lives in a Shadow DOM so its
+        // markup/styles are isolated from the page AND from the RTL processors
+        // above (which walk the light DOM only).
         var RTL_SETTINGS_KEY = 'claudeRtlUiSettings';
-        // Chat message text we restyle. If a future Claude build renames these,
-        // open DevTools from the panel to find the new class and tell the patch.
-        var RTL_MSG_SEL = '.font-claude-message, .font-user-message, [data-testid="user-message"], [data-testid="chat-input"], .prose';
+        // Chat surfaces we restyle. Verified against the shipped bundle: these
+        // classes/testids really exist in Claude's DOM.
+        var RTL_CONTAINERS = ['.font-claude-message', '.font-user-message', '[data-testid="user-message"]', '[data-testid="chat-input"]'];
         var RTL_FONTS = [
             ['Default', ''],
             ['Assistant', '"Assistant", sans-serif'],
@@ -712,10 +713,22 @@ function majorityDir(dirs) {
             ['Frank Ruehl (Hebrew)', '"FrankRuehl", "Frank Ruehl CLM", serif'],
             ['Courier New', '"Courier New", monospace']
         ];
+        var RTL_WEIGHTS = [
+            ['Default', ''], ['Light 300', '300'], ['Regular 400', '400'],
+            ['Medium 500', '500'], ['SemiBold 600', '600'], ['Bold 700', '700']
+        ];
 
+        // Build "a X, b X, c X" from the container list -- appending a suffix to a
+        // comma-joined string would only attach it to the LAST selector.
+        function rtlSel(suffix) {
+            return RTL_CONTAINERS.map(function(c) { return c + (suffix || ''); }).join(',');
+        }
+        function rtlRootFs() {
+            return parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+        }
         function rtlLoadSettings() {
             try { var raw = localStorage.getItem(RTL_SETTINGS_KEY); if (raw) return JSON.parse(raw); } catch (e) {}
-            return { fontFamily: '', fontScale: 1 };
+            return { fontFamily: '', fontWeight: '', fontScale: 1 };
         }
         function rtlSaveSettings(s) {
             try { localStorage.setItem(RTL_SETTINGS_KEY, JSON.stringify(s)); } catch (e) {}
@@ -729,13 +742,34 @@ function majorityDir(dirs) {
             }
             var scale = (s && s.fontScale) ? s.fontScale : 1;
             var fam = (s && s.fontFamily) ? s.fontFamily : '';
-            var css = RTL_MSG_SEL + '{font-size:calc(' + scale + ' * 1em)!important;}';
+            var wt = (s && s.fontWeight) ? s.fontWeight : '';
+            var css = '';
+            // SIZE: Claude's message text carries its own explicit sizes (Tailwind
+            // text-* / prose), so a font-size on the container does NOT cascade into
+            // it -- that is why only the (inheriting) chat input used to resize.
+            // zoom scales the whole block and keeps its internal hierarchy intact.
+            if (scale && scale !== 1) css += rtlSel() + '{zoom:' + scale + ';}';
+            // FAMILY: hit the container AND its descendants, since inner nodes may
+            // set their own font-family; then restore monospace for code/pre.
             if (fam) {
-                css += RTL_MSG_SEL + '{font-family:' + fam + '!important;}';
-                // keep code/pre monospaced regardless of the chosen prose font
-                css += '.prose code,.prose pre,code,pre,pre *,code *{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Courier New",monospace!important;}';
+                css += rtlSel() + ',' + rtlSel(' *') + '{font-family:' + fam + '!important;}';
+                css += rtlSel(' code') + ',' + rtlSel(' pre') + ',' + rtlSel(' code *') + ',' + rtlSel(' pre *') +
+                       '{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Courier New",monospace!important;}';
+            }
+            // WEIGHT: skip strong/b/headings so emphasis still stands out.
+            if (wt) {
+                css += rtlSel() + ',' + rtlSel(' *:not(strong):not(b):not(h1):not(h2):not(h3):not(h4):not(h5):not(h6)') +
+                       '{font-weight:' + wt + '!important;}';
             }
             st.textContent = css;
+        }
+        // rem-based so the button keeps its spot if the root font size changes.
+        function rtlApplyPos(host, s) {
+            if (s && s.posTop != null && s.posLeft != null) {
+                host.style.top = s.posTop + 'rem'; host.style.left = s.posLeft + 'rem'; host.style.right = 'auto';
+            } else {
+                host.style.top = '0.3125rem'; host.style.right = '8.0625rem'; host.style.left = 'auto';  // 5px / 129px at a 16px root
+            }
         }
 
         function initControlPanel() {
@@ -747,71 +781,127 @@ function majorityDir(dirs) {
             var host = document.createElement('div');
             host.id = 'claude-rtl-panel';
             host.setAttribute('dir', 'ltr');
-            host.style.cssText = 'position:fixed;top:40px;right:10px;z-index:2147483647;';
-            // Electron custom title bars are drag regions; keep our widget clickable.
-            host.style.webkitAppRegion = 'no-drag';
+            host.style.cssText = 'position:fixed;z-index:2147483647;';
+            host.style.webkitAppRegion = 'no-drag';   // Electron title bars are drag regions
+            rtlApplyPos(host, settings);
             var root = host.attachShadow ? host.attachShadow({ mode: 'open' }) : host;
 
-            var fontOptions = RTL_FONTS.map(function(f) {
-                var sel = (f[1] === settings.fontFamily) ? ' selected' : '';
-                return '<option value="' + f[1].replace(/"/g, '&quot;') + '"' + sel + '>' + f[0] + '</option>';
-            }).join('');
+            function opts(list, cur) {
+                return list.map(function(f) {
+                    var v = String(f[1]).replace(/"/g, '&quot;');
+                    return '<option value="' + v + '"' + (f[1] === cur ? ' selected' : '') + '>' + f[0] + '</option>';
+                }).join('');
+            }
 
             root.innerHTML =
                 '<style>' +
                 ':host,*{box-sizing:border-box;font-family:system-ui,"Segoe UI",sans-serif}' +
-                '.gear{width:32px;height:32px;border-radius:8px;background:rgba(30,30,30,.82);color:#eee;border:1px solid rgba(255,255,255,.15);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:17px;box-shadow:0 2px 8px rgba(0,0,0,.35);user-select:none}' +
+                '.gear{width:2rem;height:2rem;border-radius:.5rem;background:rgba(30,30,30,.82);color:#eee;border:1px solid rgba(255,255,255,.15);cursor:grab;display:flex;align-items:center;justify-content:center;font-size:1.05rem;box-shadow:0 2px 8px rgba(0,0,0,.35);user-select:none}' +
                 '.gear:hover{background:rgba(50,50,50,.95)}' +
-                '.menu{position:absolute;top:38px;right:0;width:232px;background:rgba(28,28,30,.98);color:#eee;border:1px solid rgba(255,255,255,.15);border-radius:10px;padding:12px;box-shadow:0 8px 28px rgba(0,0,0,.5);display:none;font-size:13px}' +
-                '.wrap:hover .menu,.menu.pin{display:block}' +
-                '.row{margin:8px 0}' +
-                '.row label{display:block;margin-bottom:4px;opacity:.8;font-size:12px}' +
-                'select{width:100%;padding:5px;border-radius:6px;background:#111;color:#eee;border:1px solid rgba(255,255,255,.2);font:inherit}' +
-                '.sz{display:flex;align-items:center;gap:8px}' +
-                '.sz button{width:30px;height:30px;border-radius:6px;background:#111;color:#eee;border:1px solid rgba(255,255,255,.2);cursor:pointer;font-size:16px;font:inherit}' +
+                '.gear.drag{cursor:grabbing}' +
+                '.menu{position:absolute;top:2.4rem;right:0;width:14.5rem;background:rgba(28,28,30,.98);color:#eee;border:1px solid rgba(255,255,255,.15);border-radius:.6rem;padding:.75rem;box-shadow:0 8px 28px rgba(0,0,0,.5);display:none;font-size:.8rem}' +
+                '.menu.open{display:block}' +
+                '.row{margin:.5rem 0}' +
+                '.row label{display:block;margin-bottom:.25rem;opacity:.8;font-size:.72rem}' +
+                'select{width:100%;padding:.3rem;border-radius:.35rem;background:#111;color:#eee;border:1px solid rgba(255,255,255,.2);font:inherit}' +
+                '.sz{display:flex;align-items:center;gap:.5rem}' +
+                '.sz button{width:1.9rem;height:1.9rem;border-radius:.35rem;background:#111;color:#eee;border:1px solid rgba(255,255,255,.2);cursor:pointer;font:inherit}' +
                 '.sz span{flex:1;text-align:center}' +
-                '.act{width:100%;padding:7px;border-radius:6px;background:#2b6cb0;color:#fff;border:0;cursor:pointer;margin-top:4px;font:inherit}' +
-                '.act.sec{background:#333}' +
+                '.act{width:100%;padding:.4rem;border-radius:.35rem;background:#333;color:#fff;border:0;cursor:pointer;margin-top:.25rem;font:inherit}' +
+                '.hint{opacity:.5;font-size:.65rem;margin-top:.4rem;text-align:center}' +
                 '</style>' +
                 '<div class="wrap">' +
-                '<div class="gear" title="Claude RTL settings">&#9881;</div>' +
+                '<div class="gear" title="Claude RTL settings (drag to move)">&#9881;</div>' +
                 '<div class="menu">' +
-                '<div class="row"><label>Chat font</label><select class="ff">' + fontOptions + '</select></div>' +
+                '<div class="row"><label>Chat font</label><select class="ff">' + opts(RTL_FONTS, settings.fontFamily || '') + '</select></div>' +
+                '<div class="row"><label>Font weight</label><select class="fw">' + opts(RTL_WEIGHTS, settings.fontWeight || '') + '</select></div>' +
                 '<div class="row"><label>Font size</label><div class="sz"><button class="dec">&#8722;</button><span class="val"></span><button class="inc">+</button></div></div>' +
-                '<div class="row"><button class="act dev">Open DevTools</button></div>' +
-                '<div class="row"><button class="act sec reset">Reset</button></div>' +
+                '<div class="row"><button class="act reset">Reset</button></div>' +
+                '<div class="hint">drag the gear to move it</div>' +
                 '</div></div>';
 
             (document.body || document.documentElement).appendChild(host);
 
             var menu = root.querySelector('.menu');
-            var val = root.querySelector('.val');
+            var gear = root.querySelector('.gear');
             var ff = root.querySelector('.ff');
+            var fw = root.querySelector('.fw');
+            var val = root.querySelector('.val');
             function renderVal() { val.textContent = Math.round((settings.fontScale || 1) * 100) + '%'; }
+            function closeMenu() { menu.classList.remove('open'); }
             renderVal();
 
-            root.querySelector('.gear').addEventListener('click', function() { menu.classList.toggle('pin'); });
             ff.addEventListener('change', function() {
-                settings.fontFamily = ff.value; rtlSaveSettings(settings); rtlApplySettings(settings);
+                settings.fontFamily = ff.value; rtlSaveSettings(settings); rtlApplySettings(settings); closeMenu();
+            });
+            fw.addEventListener('change', function() {
+                settings.fontWeight = fw.value; rtlSaveSettings(settings); rtlApplySettings(settings); closeMenu();
             });
             function bump(delta) {
                 var s = (settings.fontScale || 1) + delta;
                 s = Math.max(0.7, Math.min(2, Math.round(s * 100) / 100));
                 settings.fontScale = s; renderVal(); rtlSaveSettings(settings); rtlApplySettings(settings);
             }
+            // +/- stay open on purpose so the size can be nudged repeatedly.
             root.querySelector('.dec').addEventListener('click', function() { bump(-0.1); });
             root.querySelector('.inc').addEventListener('click', function() { bump(0.1); });
-            root.querySelector('.dev').addEventListener('click', function() {
-                // No preload/IPC bridge exists; signal the main process with a magic
-                // console message (the main-process patch listens and opens DevTools).
-                try { console.log('__CLAUDE_RTL_OPEN_DEVTOOLS__'); } catch (e) {}
-            });
             root.querySelector('.reset').addEventListener('click', function() {
-                settings = { fontFamily: '', fontScale: 1 };
-                ff.value = ''; renderVal(); rtlSaveSettings(settings); rtlApplySettings(settings);
+                settings = { fontFamily: '', fontWeight: '', fontScale: 1 };
+                ff.value = ''; fw.value = ''; renderVal();
+                rtlSaveSettings(settings); rtlApplySettings(settings); rtlApplyPos(host, settings); closeMenu();
+            });
+
+            // --- drag the gear; a press that never moves counts as a click ------
+            var dragging = false, moved = false, sx = 0, sy = 0, startL = 0, startT = 0;
+            function onMove(e) {
+                if (!dragging) return;
+                var dx = e.clientX - sx, dy = e.clientY - sy;
+                if (!moved && Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
+                moved = true; gear.classList.add('drag'); closeMenu();
+                var fs = rtlRootFs();
+                var l = Math.min(Math.max(0, startL + dx), window.innerWidth - host.offsetWidth);
+                var t = Math.min(Math.max(0, startT + dy), window.innerHeight - host.offsetHeight);
+                host.style.left = (l / fs) + 'rem'; host.style.top = (t / fs) + 'rem'; host.style.right = 'auto';
+            }
+            function onUp() {
+                document.removeEventListener('mousemove', onMove, true);
+                document.removeEventListener('mouseup', onUp, true);
+                if (!dragging) return;
+                dragging = false; gear.classList.remove('drag');
+                if (moved) {
+                    settings.posLeft = parseFloat(host.style.left);
+                    settings.posTop = parseFloat(host.style.top);
+                    rtlSaveSettings(settings);
+                } else {
+                    menu.classList.toggle('open');   // plain click toggles the menu
+                }
+            }
+            gear.addEventListener('mousedown', function(e) {
+                if (e.button !== 0) return;
+                e.preventDefault();
+                var r = host.getBoundingClientRect();
+                dragging = true; moved = false;
+                sx = e.clientX; sy = e.clientY; startL = r.left; startT = r.top;
+                document.addEventListener('mousemove', onMove, true);
+                document.addEventListener('mouseup', onUp, true);
+            });
+
+            // click anywhere outside the panel closes it (composedPath sees into shadow DOM)
+            document.addEventListener('mousedown', function(e) {
+                var path = e.composedPath ? e.composedPath() : [];
+                if (path.indexOf(host) === -1) closeMenu();
+            }, true);
+
+            // keep the button on-screen if the window is resized
+            window.addEventListener('resize', function() {
+                if (settings.posLeft == null) return;
+                var fs = rtlRootFs();
+                var l = Math.min(settings.posLeft * fs, window.innerWidth - host.offsetWidth);
+                var t = Math.min(settings.posTop * fs, window.innerHeight - host.offsetHeight);
+                host.style.left = (Math.max(0, l) / fs) + 'rem';
+                host.style.top = (Math.max(0, t) / fs) + 'rem';
             });
         }
-
         function init() {
             injectStyles();
             initControlPanel();
@@ -954,25 +1044,6 @@ $MAIN_INJECTION_CODE = @'
         var app = require('electron').app;
         if (app && app.commandLine && typeof app.commandLine.appendSwitch === 'function') {
             app.commandLine.appendSwitch('force-ui-direction', 'ltr');
-        }
-        // DevTools opener: the renderer control panel has no preload/IPC bridge, so
-        // it signals us with a magic console message; open DevTools on that page.
-        if (app && typeof app.on === 'function') {
-            app.on('web-contents-created', function(_e, wc){
-                try {
-                    wc.on('console-message', function(){
-                        var msg = '';
-                        for (var i = 0; i < arguments.length; i++) {
-                            var a = arguments[i];
-                            if (typeof a === 'string') { if (a.indexOf('__CLAUDE_RTL_') === 0) msg = a; }
-                            else if (a && typeof a === 'object' && typeof a.message === 'string') { msg = a.message; }
-                        }
-                        if (msg === '__CLAUDE_RTL_OPEN_DEVTOOLS__') {
-                            try { wc.openDevTools({ mode: 'detach' }); } catch (_) {}
-                        }
-                    });
-                } catch (_) {}
-            });
         }
     } catch (e) { try { console.error('[Claude RTL Main]', e); } catch (_) {} }
 })();
